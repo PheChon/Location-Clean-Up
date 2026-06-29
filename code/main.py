@@ -1,228 +1,490 @@
-import pandas as pd, numpy as np, re
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-from openpyxl.formatting.rule import CellIsRule
+"""
+TH44 Customer Master — Audit-Driven Data Cleaning Pipeline
+===========================================================
+Non-destructive: raw values untouched; adds _std / _valid companion cols.
+Output: 3-sheet .xlsx  (Cleaned | Issues | Notes)
+"""
 
-SRC = '/Users/phachon/Documents/DKSH/location-clean-up/input/Location TH cleanup 29052026.xlsx'
-OUT = '/Users/phachon/Documents/DKSH/location-clean-up/output/Location_TH_dedup_step1-3.xlsx'
-ACT = "Active SAP confirm by P'Ying 29May2026"
+import re
+import warnings
+from datetime import date as _date
+from pathlib import Path
 
-df = pd.read_excel(SRC, sheet_name='Location clean up', dtype=str)
-df.columns = [str(c).strip() for c in df.columns]
-df = df.rename(columns={'Unnamed: 15': '(helper) clean street spaced'})
-n = len(df)
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils.dataframe import dataframe_to_rows
 
-def s(x):
-    if x is None: return ''
-    x = str(x)
-    return '' if x.strip().lower() in ('', 'nan', 'none') else x.strip()
+warnings.filterwarnings("ignore")
 
-def strip_dot0(x):
-    x = s(x)
-    return re.sub(r'\.0$', '', x)
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
+INPUT_PATH  = Path("/mnt/user-data/uploads/24062026_TH44_all_CUSTOMERS_excl_flag_del.xlsx")
+OUTPUT_PATH = Path("/mnt/user-data/outputs/TH44_Customers_Cleaned.xlsx")
+TODAY       = pd.Timestamp(_date.today())
+MIN_DATE    = pd.Timestamp("2006-01-01")
 
-# ---------- STEP 1: CLEAN / NORMALIZE ----------
-sap   = df['SVMX_SAP_Code__c'].map(strip_dot0)
-orgid = df['Organization ID'].map(s)
-wo    = pd.to_numeric(df['No. of Work order'].map(strip_dot0), errors='coerce').fillna(0).astype(int)
-ib    = pd.to_numeric(df['No. of IB'].map(strip_dot0), errors='coerce').fillna(0).astype(int)
-conf  = df[ACT].map(s)
-status= df['Status__c'].map(s)
-lastmod = pd.to_datetime(df['LastModifiedDate'], errors='coerce', utc=True)
+DATE_COLS  = ["CHANGE DATE", "Create Date Comp", "Create Date Sale", "Create Date Gen"]
+PHONE_COLS = ["TELEPHONE1", "Telephone 2", "Mobile no", "Mobile no 2"]
+EMAIL_COLS = [
+    "E-Mail Address1", "E-Mail Address2", "E-Mail Address3",
+    "E-Mail Address4", "E-Mail Address5",
+]
+EMPTY_COLS    = ["Deletion Flag", "Cust_group3", "Customer group"]
+CONSTANT_COLS = [
+    "Company", "Saleorg", "Channel", "Division", "CCA",
+    "Cust_group4", "EB360 RP/TPI Reference Num", "Cust. E-TAX",
+]
+REDUNDANT_COUNTRY_COL = "Country"   # col-68 duplicate of COUNTRY (col-62)
 
-def clean_zip(z):
-    z = strip_dot0(z)
-    m = re.search(r'\d{5}', z)
-    return m.group(0) if m else ''
-zip5 = df['SVMXC__Zip__c'].map(clean_zip)
-
-# normalized address key for matching (street + zip), abbreviation-aware
-ABBR = ['ถนน','ตำบล','อำเภอ','จังหวัด','แขวง','เขต','หมู่ที่','หมู่',
-        'tambon','amphoe','amphur','province','district','subdistrict','sub-district',
-        'road','moo']
-def norm_street(v):
-    t = s(v).lower()
-    t = re.sub(r'<br\s*/?>', ' ', t)
-    t = t.replace('ถ.',' ').replace('ต.',' ').replace('อ.',' ').replace('จ.',' ').replace('ม.',' ')
-    t = t.replace('rd.',' ').replace('rd',' ').replace('t.',' ').replace('a.',' ')
-    for w in ABBR:
-        t = t.replace(w, ' ')
-    t = re.sub(r'[^0-9a-z\u0e00-\u0e7f]', '', t)   # drop punctuation/space, keep thai+latin+digits
-    return t
-nstreet = df['SVMXC__Street__c'].map(norm_street)
-match_key = [(ns + '|' + z) if (len(ns) >= 6 and re.search(r'\d', ns)) else '' for ns, z in zip(nstreet, zip5)]
-match_key = pd.Series(match_key, index=df.index)
-
-# ---------- STEP 2: CLUSTER (union-find) ----------
-parent = list(range(n))
-def find(a):
-    while parent[a] != a:
-        parent[a] = parent[parent[a]]; a = parent[a]
-    return a
-def union(a, b):
-    ra, rb = find(a), find(b)
-    if ra != rb: parent[max(ra,rb)] = min(ra,rb)
-
-# link by SAP code (reliable; may span orgs)
-for code, idx in pd.Series(range(n)).groupby(sap.values).groups.items():
-    if code and len(idx) > 1:
-        idx = list(idx); first = idx[0]
-        for j in idx[1:]: union(first, j)
-# link by (org id + normalized address), within same org only
-ok_addr = (orgid != '') & (match_key != '')
-for key, idx in pd.Series(np.arange(n)[ok_addr.values]).groupby(
-        (orgid[ok_addr] + '##' + match_key[ok_addr]).values).groups.items():
-    if len(idx) > 1:
-        idx = list(idx); first = idx[0]
-        for j in idx[1:]: union(int(first), int(j))
-
-root = np.array([find(i) for i in range(n)])
-df['_root'] = root
-csize = df.groupby('_root')['_root'].transform('count')
-
-# ---------- STEP 3: ELECT MASTER + ACTION ----------
-status_rank = {'Approved':4,'Draft':3,'Inactive':1,'Duplicate':1,'To be deleted':0,'0':0,'':0}
-completeness = sum([(df[c].map(s) != '').astype(int) for c in
-    ['SVMXC__Street__c','District__c','SVMXC__City__c','SVMXC__State__c','SVMXC__Zip__c']])
-active = (conf == 'Active').astype(int)
-txn = wo + ib
-recency = lastmod.view('int64').fillna(0) if hasattr(lastmod,'view') else lastmod.astype('int64')
-recency = pd.to_numeric(lastmod.astype('int64'), errors='coerce').fillna(0)
-srank = status.map(lambda x: status_rank.get(x,0))
-locid = df['Location ID'].map(s)
-
-score = pd.DataFrame({'active':active,'txn':txn,'recency':recency,'srank':srank,
-                      'comp':completeness,'locid':locid,'root':root})
-
-cluster_id = np.empty(n, dtype=object)
-master_yn  = np.array(['']*n, dtype=object)
-action     = np.empty(n, dtype=object)
-master_loc = np.empty(n, dtype=object)
-reason     = np.array(['']*n, dtype=object)
-need_rev   = np.array(['']*n, dtype=object)
-rev_note   = np.array(['']*n, dtype=object)
-method     = np.empty(n, dtype=object)
-
-cid_map = {}; next_cid = 1
-for r, grp in score.groupby('root'):
-    idx = grp.index.tolist()
-    members_sap = sap.iloc[idx]
-    members_key = (orgid.iloc[idx] + '##' + match_key.iloc[idx])
-    linked_sap  = members_sap[members_sap!=''].duplicated(keep=False).any()
-    linked_addr = members_key[match_key.iloc[idx]!=''].duplicated(keep=False).any()
-    if len(idx) == 1:
-        meth = 'Singleton'
-    elif linked_sap and linked_addr: meth = 'SAP+Address'
-    elif linked_sap: meth = 'SAP'
-    elif linked_addr: meth = 'Address'
-    else: meth = 'Mixed'
-    cid_map[r] = f'C{next_cid:05d}'; next_cid += 1
-    cid = cid_map[r]
-    for i in idx:
-        cluster_id[i] = cid; method[i] = meth
-
-    if len(idx) == 1:
-        i = idx[0]
-        master_yn[i]=''; master_loc[i]=locid.iloc[i]; action[i]='Keep (unique)'
-        reason[i]='no duplicate found in round 1'
-        continue
-    # pick master
-    g = grp.sort_values(['active','txn','recency','srank','comp','locid'],
-                        ascending=[False,False,False,False,False,False])
-    mi = g.index[0]
-    m_active = active.iloc[mi]==1; m_txn=int(txn.iloc[mi]); m_status=status.iloc[mi]
-    for i in idx:
-        master_loc[i] = locid.iloc[mi]
-        if i == mi:
-            master_yn[i]='Y'; action[i]='Master'
-            reason[i]=f"{'SAP active' if m_active else 'no active SAP'}; WO+IB={m_txn}; status={m_status or '-'}"
-        else:
-            master_yn[i]=''; action[i]='Merge'
-            reason[i]=f"merge into {locid.iloc[mi]}"
-    # review flags
-    notes=[]
-    n_active = int(active.iloc[idx].sum())
-    if n_active>1: notes.append(f'{n_active} active-SAP rows')
-    if meth in ('Address',): notes.append('address-only match (verify same site)')
-    if orgid.iloc[idx].nunique()>1: notes.append('spans >1 Organization')
-    if m_status in ('Inactive','Duplicate','To be deleted','0',''): notes.append(f'master status {m_status or "blank"}')
-    holders = int(((wo.iloc[idx]>0)|(ib.iloc[idx]>0)).sum())
-    if holders>1: notes.append(f'{holders} rows hold WO/IB (re-parent)')
-    if notes:
-        for i in idx:
-            need_rev[i]='Yes'; rev_note[i]='; '.join(notes)
-
-df['Match key (norm)'] = match_key
-df['Cluster ID'] = cluster_id
-df['Cluster size'] = csize.values
-df['Cluster method'] = method
-df['Master (Y/N)'] = master_yn
-df['Action'] = action
-df['Master Location ID'] = master_loc
-df['Master reason'] = reason
-df['Needs review'] = need_rev
-df['Review note'] = rev_note
-df = df.drop(columns=['_root'])
-
-# ---------- SUMMARY ----------
-multi = df[df['Cluster size'].astype(int)>1]
-summary = {
- 'Total location records': n,
- 'Distinct clusters': int(df['Cluster ID'].nunique()),
- 'Duplicate clusters (size>1)': int(multi['Cluster ID'].nunique()),
- 'Records in duplicate clusters': len(multi),
- 'Action = Master (survivors of dup groups)': int((df['Action']=='Master').sum()),
- 'Action = Merge (fold into master)': int((df['Action']=='Merge').sum()),
- 'Action = Keep (unique, recheck in round 2)': int((df['Action']=='Keep (unique)').sum()),
- 'Clusters by SAP only': int(multi[multi['Cluster method']=='SAP']['Cluster ID'].nunique()),
- 'Clusters by Address only': int(multi[multi['Cluster method']=='Address']['Cluster ID'].nunique()),
- 'Clusters by SAP+Address': int(multi[multi['Cluster method']=='SAP+Address']['Cluster ID'].nunique()),
- 'Records flagged Needs review': int((df['Needs review']=='Yes').sum()),
+# TINs appearing 80+ times confirmed as shared / placeholder from audit
+PLACEHOLDER_TINS = {
+    "9999999999902",   # all-9s placeholder
+    "0994000158378",   # 228× — shared/HQ TIN
+    "0994000159382",   # 183× — shared/HQ TIN
+    "0994000423179",   #  81× — shared/HQ TIN
 }
-print('=== STEP 1-3 RESULT ===')
-for k,v in summary.items(): print(f'{k:48s}: {v}')
 
-sum_df = pd.DataFrame({'Metric':list(summary.keys()),'Value':list(summary.values())})
+CATEGORICAL_ALLOWED: dict[str, set] = {
+    "Shp. Cond.":        {"01"},
+    "Group":             {"TH10", "TH11"},
+    "Acct assgmt Group": {"01", "02", "06"},
+    "TaxC":              {"1", "4"},
+}
 
-# ---------- WRITE + FORMAT ----------
-with pd.ExcelWriter(OUT, engine='openpyxl') as xl:
-    df.to_excel(xl, sheet_name='Dedup result', index=False)
-    sum_df.to_excel(xl, sheet_name='Summary', index=False)
+_issues: list[dict] = []
+_notes:  list[dict] = []
 
-wb = load_workbook(OUT)
-hdr_fill = PatternFill('solid', fgColor='1D3A2A')
-hdr_font = Font(name='Arial', bold=True, color='FFFFFF', size=10)
-thin = Side(style='thin', color='D0D0D0')
-for ws in wb.worksheets:
-    for c in ws[1]:
-        c.fill=hdr_fill; c.font=hdr_font; c.alignment=Alignment(vertical='center', wrap_text=True)
-    ws.freeze_panes = 'A2'
-    ws.row_dimensions[1].height = 30
-ws = wb['Dedup result']
-ws.auto_filter.ref = ws.dimensions
-cols = list(df.columns)
-def L(name): return get_column_letter(cols.index(name)+1)
-widths = {'Organization name':26,'Location Name':30,'SVMXC__Street__c':26,'Status__c':12,
-          'SVMX_SAP_Code__c':14,ACT:16,'Match key (norm)':24,'Cluster ID':11,'Cluster size':6,
-          'Cluster method':14,'Master (Y/N)':8,'Action':16,'Master Location ID':20,
-          'Master reason':30,'Needs review':8,'Review note':34,'No. of Work order':8,'No. of IB':8}
-for nme,w in widths.items():
-    if nme in cols: ws.column_dimensions[L(nme)].width=w
-last = ws.max_row
-arange = f'{L("Action")}2:{L("Action")}{last}'
-ws.conditional_formatting.add(arange, CellIsRule(operator='equal', formula=['"Master"'], fill=PatternFill('solid', fgColor='D5EAD9')))
-ws.conditional_formatting.add(arange, CellIsRule(operator='equal', formula=['"Merge"'], fill=PatternFill('solid', fgColor='DCE8FB')))
-ws.conditional_formatting.add(arange, CellIsRule(operator='equal', formula=['"Keep (unique)"'], fill=PatternFill('solid', fgColor='EFEEE8')))
-rrange = f'{L("Needs review")}2:{L("Needs review")}{last}'
-ws.conditional_formatting.add(rrange, CellIsRule(operator='equal', formula=['"Yes"'], fill=PatternFill('solid', fgColor='FAE6C8')))
-for ws2 in wb.worksheets:
-    for row in ws2.iter_rows(min_row=2):
-        for c in row:
-            if c.font is None or c.font.name!='Arial':
-                c.font=Font(name='Arial', size=10)
-ws.column_dimensions[L('Summary' if False else 'Action')].width=16
-wb['Summary'].column_dimensions['A'].width=46
-wb['Summary'].column_dimensions['B'].width=14
-wb.save(OUT)
-print('\nSaved:', OUT)
+# ── HELPERS ────────────────────────────────────────────────────────────────────
+def flag(bp: str, field: str, reason: str, raw) -> None:
+    _issues.append({
+        "BP Number": bp,
+        "Field":     field,
+        "Reason":    reason,
+        "Raw Value": "" if pd.isna(raw) else str(raw),
+    })
+
+def note(section: str, detail: str) -> None:
+    _notes.append({"Section": section, "Detail": detail})
+
+def digits_only(val) -> str:
+    return re.sub(r"\D", "", str(val)) if pd.notna(val) else ""
+
+def safe_name(col: str) -> str:
+    """Column name → safe identifier for companion column naming."""
+    return re.sub(r"[^A-Za-z0-9]", "_", col)
+
+def _prep(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert pd.NA → None and Timestamps → date for openpyxl."""
+    out = frame.copy()
+    for c in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[c]):
+            out[c] = [v.date() if pd.notna(v) else None for v in out[c]]
+        else:
+            out[c] = [v if pd.notna(v) else None for v in out[c]]
+    return out
+
+FILLS = {
+    "Cleaned": PatternFill("solid", start_color="1A73E8"),
+    "Issues":  PatternFill("solid", start_color="EA4335"),
+    "Notes":   PatternFill("solid", start_color="34A853"),
+}
+# Companion / added columns  — header: orange  |  data: light amber
+ADDED_HDR_FILL  = PatternFill("solid", start_color="F57C00")  # deep orange
+ADDED_DATA_FILL = PatternFill("solid", start_color="FFF3E0")  # light amber
+
+def write_sheet(wb: Workbook, name: str, data: pd.DataFrame, added_cols=None) -> None:
+    ws       = wb.create_sheet(title=name)
+    hdr_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    dat_font = Font(name="Arial", size=10)
+    hdr_fill = FILLS[name]
+
+    # Build 1-based index set of companion / added columns for this sheet
+    added_idxs = {
+        i for i, c in enumerate(data.columns, 1)
+        if added_cols and c in added_cols
+    }
+
+    rows = list(dataframe_to_rows(_prep(data), index=False, header=True))
+    for r_i, row in enumerate(rows, 1):
+        for c_i, val in enumerate(row, 1):
+            cell     = ws.cell(row=r_i, column=c_i, value=val)
+            is_added = c_i in added_idxs
+            if r_i == 1:
+                cell.font      = hdr_font
+                cell.fill      = ADDED_HDR_FILL if is_added else hdr_fill
+                cell.alignment = Alignment(horizontal="center", wrap_text=True)
+            else:
+                cell.font = dat_font
+                if is_added:
+                    cell.fill = ADDED_DATA_FILL
+                if isinstance(val, _date):
+                    cell.number_format = "YYYY-MM-DD"
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    # Width from header + first 50 data rows (fast, avoids full scan)
+    sample = rows[: min(51, len(rows))]
+    for c_i in range(1, len(rows[0]) + 1):
+        max_len = max(len(str(r[c_i - 1] or "")) for r in sample)
+        ws.column_dimensions[ws.cell(1, c_i).column_letter].width = min(max_len + 2, 55)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — LOAD
+# ══════════════════════════════════════════════════════════════════════════════
+print("─" * 62)
+print("STEP 1  Loading …")
+OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+df             = pd.read_excel(INPUT_PATH, dtype=str)
+ORIG_ROWS, ORIG_COLS = df.shape
+print(f"        {ORIG_ROWS:,} rows × {ORIG_COLS} cols")
+assert df["BP Number"].nunique() == ORIG_ROWS, "BP Number not unique on load — abort!"
+note("Load", f"Source: {INPUT_PATH.name}  |  {ORIG_ROWS:,} rows × {ORIG_COLS} cols")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — STRUCTURAL CLEANUP
+# ══════════════════════════════════════════════════════════════════════════════
+print("STEP 2  Structural cleanup …")
+
+# 2a. Log constant columns (before touching anything)
+for c in CONSTANT_COLS:
+    if c in df.columns:
+        val = df[c].dropna().iloc[0] if df[c].notna().any() else "N/A"
+        note("Constant col (kept)", f"{c!r} = {val!r}")
+
+# 2b. Drop fully-empty columns
+drop_empty = [c for c in EMPTY_COLS if c in df.columns]
+df.drop(columns=drop_empty, inplace=True)
+for c in drop_empty:
+    note("Empty col (dropped)", c)
+
+# 2c. Coalesce redundant Country (col-68) into COUNTRY (col-62), then drop
+if REDUNDANT_COUNTRY_COL in df.columns:
+    fill_mask = df["COUNTRY"].isna() & df[REDUNDANT_COUNTRY_COL].notna()
+    n_filled  = int(fill_mask.sum())
+    df.loc[fill_mask, "COUNTRY"] = df.loc[fill_mask, REDUNDANT_COUNTRY_COL]
+    df.drop(columns=[REDUNDANT_COUNTRY_COL], inplace=True)
+    note("Redundant col (dropped)",
+         f"'{REDUNDANT_COUNTRY_COL}' coalesced into COUNTRY ({n_filled} fills)")
+
+print(f"        Dropped {len(drop_empty)} empty + 1 redundant → {df.shape[1]} cols remain")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — TEXT & FLAG HYGIENE  (column-aware — never blindly strip codes)
+# ══════════════════════════════════════════════════════════════════════════════
+print("STEP 3  Text hygiene & flag normalisation …")
+
+# 3a. Trim whitespace on every text column; collapse multi-spaces; blank → NA
+_DATE_SET = set(DATE_COLS)
+for c in df.columns:
+    if c in _DATE_SET:
+        continue
+    df[c] = (
+        df[c].astype(str)
+             .str.strip()
+             .str.replace(r"\s{2,}", " ", regex=True)
+             .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA, "<NA>": pd.NA})
+    )
+
+# 3b. Blocked: SAP flag — lowercase 'x' is valid but non-standard → uppercase
+if "Blocked" in df.columns:
+    df["Blocked"] = df["Blocked"].str.upper()
+
+# 3c. Categorical anomaly detection (flag unexpected values, keep them)
+cat_issue_count = 0
+for col, allowed in CATEGORICAL_ALLOWED.items():
+    if col not in df.columns:
+        continue
+    mask = df[col].notna() & ~df[col].isin(allowed)
+    for _, row in df[mask].iterrows():
+        flag(row["BP Number"], col,
+             f"Unexpected value; allowed = {sorted(allowed)}", row[col])
+        cat_issue_count += 1
+
+print(f"        Whitespace trimmed, Blocked normalised, "
+      f"{cat_issue_count} categorical anomalies flagged")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — DATE COLUMNS
+# ══════════════════════════════════════════════════════════════════════════════
+print("STEP 4  Parsing date columns …")
+for c in DATE_COLS:
+    if c not in df.columns:
+        continue
+    parsed = pd.to_datetime(df[c], errors="coerce").dt.normalize()
+    df[c]  = parsed
+    oob    = df[parsed.notna() & ((parsed < MIN_DATE) | (parsed > TODAY))]
+    for _, row in oob.iterrows():
+        flag(row["BP Number"], c,
+             f"Date outside valid range [{MIN_DATE.date()} – {TODAY.date()}]", row[c])
+    print(f"        {c}: {parsed.notna().sum():,} valid | "
+          f"{parsed.isna().sum()} null | {len(oob)} OOB")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5a — TAX NUMBER3  (Thai TIN = exactly 13 digits)
+# ══════════════════════════════════════════════════════════════════════════════
+print("STEP 5a TIN validation (Tax Number3) …")
+if "Tax Number3" in df.columns:
+    df["Tax_Number3_digits"] = df["Tax Number3"].apply(digits_only)
+
+    def _tin_valid(row: pd.Series) -> str:
+        raw  = row["Tax Number3"]
+        digs = row["Tax_Number3_digits"]
+        bp   = row["BP Number"]
+        if pd.isna(raw):
+            return "MISSING"
+        if len(digs) != 13:
+            flag(bp, "Tax Number3",
+                 f"Wrong digit count ({len(digs)}, expected 13)", raw)
+            return "FLAG_LENGTH"
+        if digs in PLACEHOLDER_TINS or set(digs) == {"9"}:
+            flag(bp, "Tax Number3",
+                 "Shared or placeholder TIN (informational — verify before any merge)", raw)
+            return "FLAG_PLACEHOLDER"
+        return "OK"
+
+    df["Tax_Number3_valid"] = df.apply(_tin_valid, axis=1)
+    print(f"        {df['Tax_Number3_valid'].value_counts().to_dict()}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5b — POSTAL CODE  (country-aware: Thai = 5 digits, foreign = 4-10)
+# ══════════════════════════════════════════════════════════════════════════════
+print("STEP 5b Postal code validation (country-aware) …")
+if "POSTAL CODE" in df.columns:
+    def _postal_valid(row: pd.Series) -> str:
+        raw     = row["POSTAL CODE"]
+        bp      = row["BP Number"]
+        cval    = row["COUNTRY"]
+        country = str(cval).strip() if pd.notna(cval) else "Thailand"
+        if pd.isna(raw):
+            return "MISSING"
+        digs    = re.sub(r"\D", "", str(raw))
+        is_thai = country in ("Thailand", "TH", "")
+        if is_thai:
+            if re.fullmatch(r"\d{5}", digs):
+                return "OK"
+            flag(bp, "POSTAL CODE",
+                 f"Thai postal must be exactly 5 digits (got: {digs!r})", raw)
+            return "FLAG"
+        else:
+            if 4 <= len(digs) <= 10:
+                return "OK_FOREIGN"
+            flag(bp, "POSTAL CODE",
+                 f"Foreign postal suspicious digit count ({len(digs)})", raw)
+            return "FLAG"
+
+    df["Postal_Code_valid"] = df.apply(_postal_valid, axis=1)
+    print(f"        {df['Postal_Code_valid'].value_counts().to_dict()}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5c — PHONES (x4 columns)
+# Logic: Thai local 0XX → +66XX | 00XX → +XX | +XX → keep | 66XX → +66XX
+# ══════════════════════════════════════════════════════════════════════════════
+print("STEP 5c Phone normalisation …")
+
+def _phone_std_valid(raw, bp: str, field: str) -> tuple:
+    if pd.isna(raw) or str(raw).strip() == "":
+        return None, "MISSING"
+    s        = str(raw).strip()
+    has_plus = s.startswith("+")
+    digs     = re.sub(r"\D", "", s)
+
+    if len(digs) < 7:
+        flag(bp, field, f"Too short ({len(digs)} digits) to be a valid phone", raw)
+        return s, "FLAG_SHORT"
+    if len(digs) > 15:                             # ITU E.164 max = 15 digits
+        flag(bp, field,
+             f"Digit count ({len(digs)}) > 15 — may be range/extension combined", raw)
+        return s, "FLAG_LONG"
+
+    if digs.startswith("0") and 9 <= len(digs) <= 10:   # Thai local: 02-XXX / 08X-XXX
+        return "+66" + digs[1:], "OK"
+    if digs.startswith("00") and 10 <= len(digs) <= 14: # 00-prefix international
+        return "+" + digs[2:], "OK"
+    if has_plus and 10 <= len(digs) <= 15:               # already E.164 (+XX…)
+        return "+" + digs, "OK"
+    if digs.startswith("66") and 10 <= len(digs) <= 12: # Thai country code without +
+        return "+" + digs, "OK"
+
+    flag(bp, field, "Unrecognised phone format — check manually", raw)
+    return ("+" if has_plus else "") + digs, "FLAG_FORMAT"
+
+for col in PHONE_COLS:
+    if col not in df.columns:
+        continue
+    base    = safe_name(col)
+    results = df.apply(
+        lambda r, c=col: _phone_std_valid(r[c], r["BP Number"], c), axis=1
+    )
+    df[f"{base}_std"]   = [r[0] for r in results]
+    df[f"{base}_valid"] = [r[1] for r in results]
+    print(f"        {col}: {df[f'{base}_valid'].value_counts().to_dict()}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5d — EMAILS (x5 columns)
+# Auto-fix: strip spaces, -com → .com | Flag unfixable
+# ══════════════════════════════════════════════════════════════════════════════
+print("STEP 5d E-mail validation …")
+_EMAIL_RE   = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$")
+_EMAIL_FIXES = [("-com", ".com"), ("_com", ".com"), (",.com", ".com")]
+
+def _email_std_valid(raw, bp: str, field: str) -> tuple:
+    if pd.isna(raw) or str(raw).strip() == "":
+        return None, "MISSING"
+    orig = str(raw).strip()
+    std  = orig.replace(" ", "")             # strip embedded spaces
+    for bad, good in _EMAIL_FIXES:
+        std = std.replace(bad, good)
+    if _EMAIL_RE.match(std):
+        return std, "OK" if std == orig else "OK_FIXED"
+    flag(bp, field, "Invalid e-mail format (could not auto-fix)", orig)
+    return std, "FLAG"
+
+for col in EMAIL_COLS:
+    if col not in df.columns:
+        continue
+    base    = safe_name(col)
+    results = df.apply(
+        lambda r, c=col: _email_std_valid(r[c], r["BP Number"], c), axis=1
+    )
+    df[f"{base}_std"]   = [r[0] for r in results]
+    df[f"{base}_valid"] = [r[1] for r in results]
+    print(f"        {col}: {df[f'{base}_valid'].value_counts(dropna=False).to_dict()}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6 — DUPLICATE DETECTION  (FLAG ONLY — never merge, never delete)
+# Signature: normalised name + postal + phone digits (only among rows with phone)
+# ══════════════════════════════════════════════════════════════════════════════
+print("STEP 6  Duplicate candidate detection …")
+df["_sig"] = (
+    df["NAME1"].fillna("").str.lower().str.strip()
+    + "|" + df["POSTAL CODE"].fillna("")
+    + "|" + df["TELEPHONE1"].apply(digits_only)
+)
+with_phone = df["TELEPHONE1"].notna()
+sig_counts = df.loc[with_phone, "_sig"].value_counts()
+dup_sigs   = set(sig_counts[sig_counts > 1].index)
+
+df["duplicate_candidate"] = df.apply(
+    lambda r: "FLAG"
+    if (pd.notna(r["TELEPHONE1"]) and r["_sig"] in dup_sigs)
+    else "",
+    axis=1,
+)
+n_dup = (df["duplicate_candidate"] == "FLAG").sum()
+for sig, cnt in sig_counts[sig_counts > 1].items():
+    bp_list = " | ".join(df.loc[df["_sig"] == sig, "BP Number"].tolist())
+    flag(bp_list, "NAME1 + POSTAL CODE + TELEPHONE1",
+         f"Possible duplicate group ({cnt} records — review before any merge)", sig)
+
+df.drop(columns=["_sig"], inplace=True)
+print(f"        {n_dup} rows flagged as duplicate_candidate")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 7 — ASSEMBLE OUTPUT WORKBOOK  (Cleaned | Issues | Notes)
+# ══════════════════════════════════════════════════════════════════════════════
+print("STEP 7  Assembling output workbook …")
+
+issues_df = pd.DataFrame(_issues, columns=["BP Number", "Field", "Reason", "Raw Value"])
+
+note("─" * 40, "")
+note("Stats", f"Original:             {ORIG_ROWS:,} rows × {ORIG_COLS} cols")
+note("Stats", f"Cleaned:              {len(df):,} rows × {df.shape[1]} cols")
+note("Stats", f"Total issues flagged: {len(issues_df):,}")
+note("Stats", f"Duplicate candidates: {n_dup:,}")
+note("─" * 40, "")
+note("Issues breakdown by field", "")
+for field, cnt in issues_df["Field"].value_counts().head(20).items():
+    note("  →", f"{field}: {cnt:,}")
+note("─" * 40, "")
+note("Companion columns added", "")
+for c in df.columns:
+    if (c.endswith("_std") or c.endswith("_valid")
+            or c in {"Tax_Number3_digits", "duplicate_candidate"}):
+        note("  +", c)
+
+notes_df = pd.DataFrame(_notes, columns=["Section", "Detail"])
+
+wb = Workbook()
+del wb["Sheet"]
+# Identify every companion column added by the pipeline
+added_col_names = {
+    c for c in df.columns
+    if c.endswith("_std") or c.endswith("_valid")
+    or c in {"Tax_Number3_digits", "duplicate_candidate"}
+}
+write_sheet(wb, "Cleaned", df,        added_col_names)  # highlight companion cols
+write_sheet(wb, "Issues",  issues_df)
+write_sheet(wb, "Notes",   notes_df)
+wb.save(OUTPUT_PATH)
+print(f"        Saved → {OUTPUT_PATH}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 8 — VALIDATION GATE  (evidence before claims)
+# ══════════════════════════════════════════════════════════════════════════════
+print("STEP 8  Validation gate …")
+fails: list[str] = []
+
+# Row / key integrity
+if len(df) != ORIG_ROWS:
+    fails.append(f"Row count drifted: {ORIG_ROWS} → {len(df)}")
+if df["BP Number"].nunique() != len(df):
+    fails.append("BP Number uniqueness broken after cleaning")
+
+# Blocked flag sanity
+if "Blocked" in df.columns:
+    bad_blocked = set(df["Blocked"].dropna().unique()) - {"X"}
+    if bad_blocked:
+        fails.append(f"Blocked still contains non-X values: {bad_blocked}")
+
+# Date columns properly typed
+for c in DATE_COLS:
+    if c in df.columns and not pd.api.types.is_datetime64_any_dtype(df[c]):
+        fails.append(f"Date column not typed as datetime: {c!r}")
+
+# All companion columns present
+expected = (
+    [f"{safe_name(c)}_valid" for c in PHONE_COLS]
+    + [f"{safe_name(c)}_valid" for c in EMAIL_COLS]
+    + ["Tax_Number3_valid", "Postal_Code_valid"]
+)
+for vcol in expected:
+    if vcol not in df.columns:
+        fails.append(f"Missing companion column: {vcol!r}")
+
+# Issues table populated (audit guarantees known issues)
+if len(issues_df) == 0:
+    fails.append("Issues table is empty — expected known flagged records")
+
+# No remaining leading/trailing whitespace in text columns
+padded_count = sum(
+    int((df[c].dropna().astype(str) != df[c].dropna().astype(str).str.strip()).sum())
+    for c in df.select_dtypes("object").columns
+)
+if padded_count:
+    fails.append(f"{padded_count} cells still have leading/trailing whitespace")
+
+for msg in fails:
+    print(f"  ✗  {msg}")
+if not fails:
+    print("  ✓  All validation checks passed")
+
+# ── FINAL SUMMARY ──────────────────────────────────────────────────────────────
+tin_flags    = (df["Tax_Number3_valid"].str.startswith("FLAG")).sum() \
+               if "Tax_Number3_valid" in df.columns else 0
+postal_flags = (df["Postal_Code_valid"].str.startswith("FLAG")).sum() \
+               if "Postal_Code_valid" in df.columns else 0
+
+print()
+print("═" * 62)
+print("  TH44 Customer Master — Pipeline Complete")
+print(f"  Rows:                 {ORIG_ROWS:,} → {len(df):,}  (unchanged)")
+print(f"  Cols:                 {ORIG_COLS}  → {df.shape[1]}  "
+      f"(+{df.shape[1] - ORIG_COLS} companion cols)")
+print(f"  Issues logged:        {len(issues_df):,}")
+print(f"    ∟ TIN flags:        {tin_flags:,}")
+print(f"    ∟ Postal flags:     {postal_flags:,}")
+print(f"    ∟ Dup candidates:   {n_dup:,}")
+print(f"  Validation:           {'PASSED ✓' if not fails else 'FAILED ✗'}")
+print(f"  Output:               {OUTPUT_PATH.name}")
+print("═" * 62)
