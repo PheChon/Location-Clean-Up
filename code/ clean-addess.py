@@ -19,9 +19,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils.dataframe import dataframe_to_rows
 
-DB    = Path("/mnt/user-data/uploads/thai-postal-codes_V2.xlsx")
-DATA  = Path("/mnt/user-data/uploads/24062026_TH44_all_CUSTOMERS_excl_flag_del.xlsx")
-OUT   = Path("/mnt/user-data/outputs/TH44_Addresses_Cleaned_V2.xlsx")
+DB    = Path("/Users/phachon/Documents/DKSH/location-clean-up/input/thai-postal-codes_V2.xlsx")
+DATA  = Path("/Users/phachon/Documents/DKSH/location-clean-up/input/TH44_all_CUSTOMERS_excl_flag_del.xlsx")
+OUT   = Path("/Users/phachon/Documents/DKSH/location-clean-up/output/TH44_Addresses_Cleaned_V2.xlsx")
 
 ACCEPT, EXACT = 0.60, 0.999          # match thresholds (tunable)
 
