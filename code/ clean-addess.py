@@ -70,6 +70,13 @@ def norm_road(s):
     if not s: return None
     s = re.sub(r"^ถ\.\s*", "ถนน", s); s = re.sub(r"^ซ\.\s*", "ซอย", s)
     return s
+def norm_soi(s):
+    s = clean_ws(s)
+    if not s: return None
+    s = re.sub(r"ซ\.", "ซอย", s)               # ซ. -> ซอย (ทุกตำแหน่ง)
+    s = re.sub(r"^ซ(?=\s)", "ซอย", s)          # 'ซ ' ขึ้นต้น -> ซอย
+    s = re.sub(r"^soi\b", "Soi", s, flags=re.I) # soi -> Soi (อังกฤษ)
+    return re.sub(r"\s{2,}", " ", s).strip()
 
 # ── in-house n-gram cosine matcher ─────────────────────────────────────────────
 class NGramCosine:
@@ -291,14 +298,19 @@ for i in df.index:
             dist_rec = None
             if g["Other city"]: flags.append(f"district:unmatched({g['Other city']})"); comps.append("REVIEW")
 
-    # ---- STREET DETAIL (raw untouched; new values to correct columns) ----
+    # ---- STREET DETAIL (raw untouched; new values to correct columns; full form) ----
     house, bld = parse_house(g["STREET2"])
-    if bld: flags.append(f"wrong_column:STREET2_is_name(->building)")
+    if bld: flags.append("wrong_column:STREET2_is_name(->building)")
     moo = parse_moo(g["STREET3"])
     road = norm_road(g["STREET5"])
     if road and road != g["STREET5"]: flags.append("road:abbrev_expanded")
-    soi = g["STREET4"] if (g["STREET4"] and re.search(r"ซอย|ซ\.|soi", g["STREET4"], re.I)
-                           and (not sub_rec or sub_src != "STREET4")) else None
+    soi_raw = g["STREET4"] if (g["STREET4"] and re.search(r"ซอย|ซ\.|soi", g["STREET4"], re.I)
+                               and (not sub_rec or sub_src != "STREET4")) else None
+    soi = norm_soi(soi_raw)
+    if soi and soi != soi_raw: flags.append("soi:abbrev_expanded")
+    # full-form column values (เต็มรูปแบบทุก column)
+    house_col = f"เลขที่ {house}" if house else ""
+    moo_col = f"หมู่ที่ {moo}" if moo else ""
 
     # values
     sub_th = sub_rec["sub_th"] if sub_rec else ""
@@ -311,9 +323,9 @@ for i in df.index:
 
     # ---- ASSEMBLE (full_th = always proper Thai; full_en = always English) ----
     seg = []
-    if house: seg.append(f"เลขที่ {house}")
+    if house_col: seg.append(house_col)
     if bld: seg.append(bld)
-    if moo: seg.append(f"หมู่ที่ {moo}")
+    if moo_col: seg.append(moo_col)
     if soi: seg.append(soi)
     if road: seg.append(road)
     if sub_th: seg.append(sub_th)
@@ -339,7 +351,7 @@ for i in df.index:
     dist_score = 1.0 if (dist_rec and (len(dist_recs) == 1 or sub_rec)) else (sub_s if dist_rec else 0.0)
     conf = round(100 * (0.34 * prov_s + 0.33 * min(dist_score, 1.0) + 0.33 * min(sub_score, 1.0)))
 
-    rows.append(dict(house=house or "", bld=bld or "", moo=moo or "", soi=soi or "", road=road or "",
+    rows.append(dict(house=house_col, bld=bld or "", moo=moo_col, soi=soi or "", road=road or "",
                      sub=sub_th, sub_en=sub_en, dist=dist_th, dist_en=dist_en,
                      prov=prov_native, prov_en=prov_en or "", postal=postal or "", country="Thailand",
                      tid=tid, did=did, pid=pid, full_th=full_th, full_en=full_en,
