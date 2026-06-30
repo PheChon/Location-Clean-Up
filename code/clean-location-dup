@@ -23,7 +23,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 
 SAP_FILE    = Path("/Users/phachon/Documents/DKSH/location-clean-up/input/Location TH cleanup_new.xlsx")
 MASTER_FILE = Path("/Users/phachon/Documents/DKSH/location-clean-up/output/TH44_Addresses_Cleaned_V2.xlsx")
-OUT         = Path("/mnt/user-data/outputs/SAP_Location_Step1_MasterMatch.xlsx")
+OUT         = Path("/Users/phachon/Documents/DKSH/location-clean-up/output/SAP_Location_Step1_MasterMatch.xlsx")
 NAME_SIM_THRESHOLD = 0.55          # ต่ำกว่านี้ -> flag NAME_MISMATCH (ปรับได้)
 
 # ── key + name normalization ──────────────────────────────────────────────────
