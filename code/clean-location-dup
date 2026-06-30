@@ -1,0 +1,218 @@
+"""
+SAP <-> MASTER RECONCILIATION — STEP 1
+======================================
+จับคู่ SAP code ของ file SAP (Location) กับ master (TH44 ที่ clean แล้ว)
+แล้วดึง ชื่อ + ที่อยู่ clean (TH/EN) มาใส่เป็นคอลัมน์ใหม่ (non-destructive)
+
+Inputs (2 ไฟล์ — ไม่ต้องใช้ Postal DB เพราะที่อยู่ master clean มาแล้ว):
+  • file SAP : Location_TH_cleanup_new.xlsx   (sheet 'Location clean up', 18,007 locations)
+  • master   : TH44_Addresses_Cleaned_V2.xlsx (sheet 'Addresses', 10,882 customers)
+Output:
+  • SAP_Location_Step1_MasterMatch.xlsx (sheets: Location_Matched | Summary | Notes)
+
+หลักการ: join ด้วย ID ตรง ๆ หลัง normalize leading zeros
+  SVMX_SAP_Code__c '170236703' (9 หลัก) <-> Cuscode '0170236703' (10 หลักเติม 0)
+Pure stdlib + pandas + openpyxl.
+"""
+import re, difflib
+from pathlib import Path
+from collections import Counter
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+
+SAP_FILE    = Path("/Users/phachon/Documents/DKSH/location-clean-up/input/Location TH cleanup_new.xlsx")
+MASTER_FILE = Path("/Users/phachon/Documents/DKSH/location-clean-up/output/TH44_Addresses_Cleaned_V2.xlsx")
+OUT         = Path("/mnt/user-data/outputs/SAP_Location_Step1_MasterMatch.xlsx")
+NAME_SIM_THRESHOLD = 0.55          # ต่ำกว่านี้ -> flag NAME_MISMATCH (ปรับได้)
+
+# ── key + name normalization ──────────────────────────────────────────────────
+def canon(s):
+    """canonical SAP key: strip + ตัด leading zeros."""
+    if pd.isna(s): return None
+    s = str(s).strip()
+    return (s.lstrip('0') or '0') if s else None
+
+SUFFIX = re.compile(
+    r'\b(co\.?\s*,?\s*ltd\.?|company\s*limited|limited|ltd\.?|public\s*company\s*limited|'
+    r'plc|inc\.?|corporation|corp\.?|บริษัท|จำกัด|มหาชน|\(thailand\)|\(ประเทศไทย\))\b', re.I)
+def norm_name(s):
+    if pd.isna(s): return ''
+    s = str(s).lower()
+    s = re.sub(r'\(.*?\)', ' ', s)              # ตัดวงเล็บ (สาขา/HQ descriptor)
+    s = re.split(r'\s[-–]\s', s)[0]              # ตัดหลัง " - "
+    s = SUFFIX.sub(' ', s)                       # ตัดคำต่อท้ายบริษัท
+    s = re.sub(r'[^a-z0-9ก-๙]+', '', s)          # เหลือ alnum + ไทย
+    return s.strip()
+def name_sim(a, b):
+    a, b = norm_name(a), norm_name(b)
+    if not a or not b: return None
+    if a == b or a in b or b in a: return 1.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+# ── load ──────────────────────────────────────────────────────────────────────
+print("Loading SAP (Location) + master …")
+sap = pd.read_excel(SAP_FILE, sheet_name="Location clean up", dtype=str)
+mas = pd.read_excel(MASTER_FILE, sheet_name="Addresses", dtype=str)
+sap['_k'] = sap['SVMX_SAP_Code__c'].apply(canon)
+mas['_k'] = mas['Cuscode'].apply(canon)
+print(f"  SAP {len(sap)} locations | master {len(mas)} customers")
+
+# master lookup (Cuscode unique → 1:1)
+M = {r['_k']: r for _, r in mas.iterrows() if r['_k']}
+
+# multi-location codes (เฉพาะที่ match)
+matched_mask = sap['_k'].notna() & sap['_k'].isin(M)
+code_counts = sap.loc[matched_mask, '_k'].value_counts()
+
+# ── per-row enrichment ────────────────────────────────────────────────────────
+print("Matching + pulling clean address …")
+rows = []
+for _, r in sap.iterrows():
+    k = r['_k']
+    status = mcus = mname = fth = fen = mstat = nchk = multi = ""
+    if k is None or pd.isna(k):
+        status = "NO_SAP_CODE"
+    elif k in M:
+        status = "MATCHED"
+        mr = M[k]
+        mcus  = mr['Cuscode']
+        mname = mr.get('NAME1') or ""
+        fth   = mr.get('addr_full_th') or ""
+        fen   = mr.get('addr_full_en') or ""
+        mstat = mr.get('addr_status') or ""
+        s1 = name_sim(mname, r.get('Location Name'))
+        s2 = name_sim(mname, r.get('Organization name'))
+        cand = [x for x in (s1, s2) if x is not None]
+        best = max(cand) if cand else None
+        nchk = "OK" if (best is None or best >= NAME_SIM_THRESHOLD) else f"NAME_MISMATCH (sim={best:.2f})"
+        cnt = int(code_counts.get(k, 1))
+        if cnt > 1:
+            multi = f"SHARED_SAP_CODE: code มีใน master แต่ผูกกับ {cnt} locations"
+    else:
+        status = "ORPHAN_SAP"
+    rows.append((status, mcus, mname, fth, fen, mstat, nchk, multi))
+
+ADDED = ['sap_match_status','master_cuscode','master_name','master_addr_full_th',
+         'master_addr_full_en','master_addr_status','name_check','multi_location_note']
+add = pd.DataFrame(rows, columns=ADDED, index=sap.index)
+out = pd.concat([sap.drop(columns=['_k']), add], axis=1)
+
+# ── workbook ──────────────────────────────────────────────────────────────────
+print("Writing workbook …")
+FILL = {"MATCHED":PatternFill("solid",start_color="C8E6C9"),
+        "ORPHAN_SAP":PatternFill("solid",start_color="FFF9C4"),
+        "NO_SAP_CODE":PatternFill("solid",start_color="E0E0E0")}
+RED   = PatternFill("solid", start_color="FFCDD2")
+ORANGE= PatternFill("solid", start_color="FFE0B2")
+hdr_add = PatternFill("solid", start_color="F57C00")
+hdr_org = PatternFill("solid", start_color="37474F")
+
+wb = Workbook(); del wb["Sheet"]; ws = wb.create_sheet("Location_Matched")
+cols = list(out.columns)
+addset = {cols.index(c)+1 for c in ADDED}
+sc = cols.index('sap_match_status')+1
+nc = cols.index('name_check')+1
+mc = cols.index('multi_location_note')+1
+data = [[v if pd.notna(v) else None for v in row] for row in out.itertuples(index=False)]
+allrows = [cols] + data
+for ri, row in enumerate(allrows, 1):
+    for ci, val in enumerate(row, 1):
+        cell = ws.cell(ri, ci, val)
+        if ri == 1:
+            cell.font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+            cell.fill = hdr_add if ci in addset else hdr_org
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        else:
+            cell.font = Font(name="Arial", size=10)
+            if ci == sc and val in FILL: cell.fill = FILL[val]
+            elif ci == nc and isinstance(val,str) and val.startswith("NAME_MISMATCH"): cell.fill = RED
+            elif ci == mc and val: cell.fill = ORANGE
+ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
+for ci in range(1, len(cols)+1):
+    w = max((len(str(r[ci-1] or "")) for r in allrows[:60]), default=10)
+    ws.column_dimensions[ws.cell(1,ci).column_letter].width = min(w+2, 50)
+
+# Summary
+st = Counter(out['sap_match_status'])
+nmis = (out['name_check'].astype(str).str.startswith("NAME_MISMATCH")).sum()
+nok  = (out['name_check']=="OK").sum()
+multi_rows = (out['multi_location_note'].astype(str).str.len()>0).sum()
+multi_codes = int((code_counts>1).sum())
+ws2 = wb.create_sheet("Summary")
+summary = [
+    ["SAP ↔ Master Step 1 — Summary", ""],
+    ["", ""],
+    ["หมวด (sap_match_status)", "จำนวน", "%"],
+    ["MATCHED (มี code + ตรง master → ดึงที่อยู่)", st.get("MATCHED",0), f"{100*st.get('MATCHED',0)/len(out):.1f}%"],
+    ["ORPHAN_SAP (มี code แต่ไม่อยู่ใน master)", st.get("ORPHAN_SAP",0), f"{100*st.get('ORPHAN_SAP',0)/len(out):.1f}%"],
+    ["NO_SAP_CODE (ไม่มี code → duplicate/ใหม่)", st.get("NO_SAP_CODE",0), f"{100*st.get('NO_SAP_CODE',0)/len(out):.1f}%"],
+    ["รวม", len(out), "100%"],
+    ["", ""],
+    ["การตรวจชื่อ (เฉพาะ MATCHED)", "จำนวน", ""],
+    ["  ชื่อตรง (OK)", nok, ""],
+    ["  ⚠ ชื่อไม่ตรง (NAME_MISMATCH)", nmis, "← ตรวจว่า code ผูกผิดบริษัทไหม"],
+    ["", ""],
+    ["Multi-location SAP codes", "", ""],
+    ["  จำนวน code ที่ผูกหลาย location", multi_codes, ""],
+    ["  จำนวนแถวที่เกี่ยวข้อง", multi_rows, "← duplicate candidate (Step 3)"],
+]
+for ri,row in enumerate(summary,1):
+    for ci,val in enumerate(row,1):
+        c=ws2.cell(ri,ci,val)
+        if ri==1: c.font=Font(bold=True,size=13)
+        elif row and str(row[0]).strip() in ("หมวด (sap_match_status)","การตรวจชื่อ (เฉพาะ MATCHED)","Multi-location SAP codes"): c.font=Font(bold=True)
+        if ci==1 and val in FILL: c.fill=FILL[val]
+ws2.column_dimensions['A'].width=46; ws2.column_dimensions['B'].width=12; ws2.column_dimensions['C'].width=40
+
+# Notes
+ws3 = wb.create_sheet("Notes")
+def put(r,t,b=False,fill=None,col=1):
+    c=ws3.cell(r,col,t); c.font=Font(bold=b,name="Arial",size=12 if (b and r==1) else (11 if b else 10),color="FFFFFF" if fill else "000000")
+    if fill:c.fill=fill
+    c.alignment=Alignment(wrap_text=True,vertical="top"); return c
+r=1
+put(r,"SAP ↔ Master Reconciliation — STEP 1 — วิธีการ",True); r+=2
+put(r,"วิธีการ",True); r+=1
+for ln in [
+ "• จับคู่ SVMX_SAP_Code__c (file SAP) กับ Cuscode (master) ด้วย ID ตรง ๆ",
+ "• KEY: normalize ตัด leading zeros ทั้งสองฝั่ง — '170236703' (SAP 9 หลัก) = '0170236703' (master 10 หลัก)",
+ "• master Cuscode ไม่ซ้ำ → แต่ละ code ที่ match ดึงได้ 1 แถวแบบ 1:1",
+ "• ข้อมูลดิบของ file SAP ไม่ถูกแก้ — เพิ่มเฉพาะคอลัมน์ master_* เข้าไป",
+ "• ไม่ใช้ Postal DB เพราะที่อยู่ใน master clean มาแล้วจากงานก่อนหน้า",
+]: put(r,ln); r+=1
+r+=1
+put(r,"สถานะ (sap_match_status) และสี",True); r+=1
+for stt,desc in [("MATCHED","มี SAP code + ตรงกับ master → ดึง master_name + ที่อยู่ clean TH/EN มาใส่"),
+                 ("ORPHAN_SAP","มี SAP code แต่ไม่อยู่ใน master (code ผิด/เลิกใช้) → ตรวจใน Step 2"),
+                 ("NO_SAP_CODE","ไม่มี SAP code → น่าจะ duplicate ของที่จริง หรือสถานที่ใหม่ → Step 3")]:
+    put(r,stt,fill=FILL[stt]); ws3.cell(r,2,desc).font=Font(name="Arial",size=10); ws3.cell(r,2).alignment=Alignment(wrap_text=True,vertical="top"); r+=1
+r+=1
+put(r,"คอลัมน์ที่เพิ่ม",True); r+=1
+for ln in [
+ "master_cuscode — Cuscode ของ master ที่จับคู่ได้ (หลักฐานการ match)",
+ "master_name — ชื่อลูกค้า (NAME1) จาก master",
+ "master_addr_full_th / master_addr_full_en — ที่อยู่ clean เต็ม 2 ภาษา (พร้อมใช้)",
+ "master_addr_status — สถานะความสะอาดของที่อยู่ master นั้น (VERIFIED/AUTO_FIXED/...)",
+ "name_check — OK หรือ NAME_MISMATCH(sim) : เทียบ master_name กับ Location/Organization name",
+ "             (ช่องแดง = code ตรงแต่ชื่อต่างมาก อาจผูก code ผิดบริษัท ควรตรวจ)",
+ "multi_location_note — code ที่มีใน master แต่ผูกกับหลาย location (ช่องส้ม = duplicate candidate)",
+]: put(r,ln); r+=1
+r+=1
+put(r,"ข้อจำกัด / ขั้นต่อไป",True); r+=1
+for ln in [
+ "• name_check เป็น heuristic (เทียบชื่อหลังตัดคำต่อท้ายบริษัท) — ใช้คัดกรอง ไม่ใช่คำตัดสิน",
+ "• ที่อยู่ที่ดึงมาบางอันอาจเป็น NEEDS_REVIEW ใน master เอง (ดู master_addr_status)",
+ "• ORPHAN_SAP (Step 2): เอาที่อยู่ไป fuzzy match หาลูกค้าที่ถูก / flag ให้แก้ code",
+ "• NO_SAP_CODE (Step 3): clean ที่อยู่ component แล้ว dedup เทียบกลุ่ม MATCHED → ยุบรวม/สร้าง code ใหม่",
+]: put(r,ln); r+=1
+ws3.column_dimensions['A'].width=30; ws3.column_dimensions['B'].width=95
+
+wb.save(OUT)
+print("\n"+"="*58+"\n  STEP 1 COMPLETE")
+print(f"  Locations: {len(out):,}")
+for k in ["MATCHED","ORPHAN_SAP","NO_SAP_CODE"]:
+    print(f"    {k:12} {st.get(k,0):6,} ({100*st.get(k,0)/len(out):4.1f}%)")
+print(f"  name OK {nok:,} | NAME_MISMATCH {nmis:,}")
+print(f"  multi-location: {multi_codes} codes / {multi_rows} rows")
+print(f"  Output: {OUT.name}\n"+"="*58)
