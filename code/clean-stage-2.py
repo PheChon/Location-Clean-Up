@@ -20,10 +20,10 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
-DB     = Path("/Users/phachon/Documents/DKSH/location-clean-up/input/thai-postal-codes_V2.xlsx")
-DATA   = Path("/Users/phachon/Documents/DKSH/location-clean-up/input/Location_TH_cleanup_new.xlsx")
+DB   = Path("/Users/phachon/Documents/DKSH/location-clean-up/input/thai-postal-codes_V2.xlsx")
+DATA = Path("/Users/phachon/Documents/DKSH/location-clean-up/input/Location_TH_cleanup_new.xlsx")
 MASTER = Path("/Users/phachon/Documents/DKSH/location-clean-up/output/TH44_Addresses_Cleaned_V2.xlsx")
-OUT    = Path("/Users/phachon/Documents/DKSH/location-clean-up/output/SAP_Location_Stage2_AddressClean.xlsx")
+OUT  = Path("/Users/phachon/Documents/DKSH/location-clean-up/output/SAP_Location_Stage2-2_AddressClean.xlsx")
 
 ACCEPT, EXACT   = 0.60, 0.999   # Stage-1 address-match thresholds
 NAME_FLOOR      = 0.55          # ต่ำกว่านี้ไม่นับเป็น candidate เลย (ตาม Step1)
@@ -484,6 +484,21 @@ print(f"  done: {len(match_rows):,} non-maskey rows matched")
 print("  action distribution:", Counter(v['action'] for v in match_rows.values()))
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PART E.2 — DELETE rule: REVIEW/NEW (หา maskey ให้ MERGE_WITH ไม่ได้) + ไม่มีทั้ง WO และ IB
+# ไม่แตะ ASSIGN_CODE (รู้ตัวตนจาก master แล้ว แค่ไม่มี maskey ให้ join — เก็บไว้)
+# ══════════════════════════════════════════════════════════════════════════════
+print("Applying DELETE rule (REVIEW/NEW + ไม่มีทั้ง WO และ IB) …")
+no_wo_ib = sap['No. of Work order'].isna() & sap['No. of IB'].isna()
+n_deleted=0
+for i,v in match_rows.items():
+    if v['action'] in ('REVIEW','NEW') and no_wo_ib[i]:
+        v['method'] = (v['method']+'+' if v['method'] else '') + 'no_WO_no_IB'
+        v['action'] = 'DELETE'
+        n_deleted+=1
+print(f"  DELETE: {n_deleted:,} แถว (จาก REVIEW/NEW ที่ไม่มีทั้ง WO และ IB)")
+print("  action distribution (หลัง DELETE rule):", Counter(v['action'] for v in match_rows.values()))
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PART F — maskey-side info (Step-1 equivalent, own SAP code) + assemble output
 # ══════════════════════════════════════════════════════════════════════════════
 print("Computing maskey-side master info …")
@@ -542,7 +557,7 @@ FILL_ADDR={"VERIFIED":PatternFill("solid",start_color="C8E6C9"),"AUTO_FIXED":Pat
       "FUZZY_FIXED":PatternFill("solid",start_color="FFF9C4"),"NEEDS_REVIEW":PatternFill("solid",start_color="FFCDD2")}
 FILL_ACTION={"MASKEY":PatternFill("solid",start_color="B0BEC5"),"MERGE_WITH":PatternFill("solid",start_color="C8E6C9"),
       "ASSIGN_CODE":PatternFill("solid",start_color="A5D6A7"),"REVIEW":PatternFill("solid",start_color="FFF9C4"),
-      "NEW":PatternFill("solid",start_color="E0E0E0")}
+      "NEW":PatternFill("solid",start_color="E0E0E0"),"DELETE":PatternFill("solid",start_color="EF9A9A")}
 RED=PatternFill("solid",start_color="FFCDD2"); ORANGE=PatternFill("solid",start_color="FFE0B2")
 
 wb=Workbook(); del wb["Sheet"]; ws=wb.create_sheet("Locations_Matched")
@@ -578,7 +593,7 @@ N=len(out); action_ct=Counter(out['match_action'])
 ws2=wb.create_sheet("Summary")
 rowsS=[["SAP <-> Master — Stage 2 Multi-Signal Matching — Summary",""],["",""],
        ["match_action (ทุก 18,007 แถว)","จำนวน","%"]]
-for k in ["MASKEY","MERGE_WITH","ASSIGN_CODE","REVIEW","NEW"]:
+for k in ["MASKEY","MERGE_WITH","ASSIGN_CODE","REVIEW","NEW","DELETE"]:
     rowsS.append([k, action_ct.get(k,0), f"{100*action_ct.get(k,0)/N:.1f}%"])
 rowsS+=[["รวม",N,"100%"],["",""],
     ["เฉพาะ non-maskey (8,836 แถว ที่พยายาม match)","",""],
@@ -629,6 +644,10 @@ for t,b in [("SAP ↔ Master — Stage 2: Multi-Signal Matching — วิธี
  ("match_target_location_ids — location(s) ที่มี maskey อยู่แล้วที่ Cuscode นี้ (เฉพาะ MERGE_WITH)",False),
  ("match_method — สัญญาณที่ใช้ตัดสิน (org_sibling/name_exact/name_fuzzy/addr)",False),
  ("match_score / review_candidates — คะแนน / รายชื่อ candidate ให้คนตรวจ (เฉพาะ REVIEW)",False),
+ ("",False),("★ DELETE rule: REVIEW/NEW (หา maskey ให้ MERGE_WITH ไม่ได้) + ไม่มีทั้ง No. of Work order และ No. of IB เลย -> DELETE",True),
+ ("  ไม่แตะ ASSIGN_CODE (รู้ตัวตนจาก master แล้วแม้ไม่มี maskey — เก็บไว้เสมอ) และไม่แตะ MASKEY/MERGE_WITH อยู่แล้ว",False),
+ ("  เหตุผล: ไม่มีทั้งประวัติงานซ่อม (WO) และอุปกรณ์ติดตั้ง (IB) = ไม่เคยมีกิจกรรมจริง ต่อให้หาเจ้าของไม่ได้ก็ไม่เสียข้อมูลสำคัญถ้าลบ",False),
+ ("  หมายเหตุ: ค่า WO/IB ที่ 'ไม่มี' เก็บเป็นค่าว่าง (blank) ในไฟล์ต้นฉบับ ไม่ใช่เลข 0 — เช็คด้วยเงื่อนไข 'ว่างทั้งคู่'",False),
  ("",False),("ขอบเขต: จับคู่ non-maskey ↔ master เท่านั้น (ยังไม่ทำ duplicate-clustering ระหว่าง non-maskey กันเอง — เลื่อนไป stage ถัดไป)",True),
  ("สถานะสี match_action: เทา MASKEY · เขียว MERGE_WITH/ASSIGN_CODE · เหลือง REVIEW · เทาอ่อน NEW",True)]:
     put(r,t,b); r+=1
@@ -637,6 +656,6 @@ wb.save(OUT)
 
 print("\n"+"="*58+"\n  STAGE 2 COMPLETE")
 print(f"  Total: {N:,} | non-maskey attempted: {len(match_rows):,}")
-for k in ["MASKEY","MERGE_WITH","ASSIGN_CODE","REVIEW","NEW"]:
+for k in ["MASKEY","MERGE_WITH","ASSIGN_CODE","REVIEW","NEW","DELETE"]:
     print(f"    {k:12} {action_ct.get(k,0):6,} ({100*action_ct.get(k,0)/N:4.1f}%)")
 print(f"  Output: {OUT.name}\n"+"="*58)
