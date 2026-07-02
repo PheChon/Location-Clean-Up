@@ -1,0 +1,4 @@
+DB   = Path("/Users/phachon/Documents/DKSH/location-clean-up/input/thai-postal-codes_V2.xlsx")
+DATA = Path("/Users/phachon/Documents/DKSH/location-clean-up/input/Location_TH_cleanup_new.xlsx")
+MASTER = Path("/Users/phachon/Documents/DKSH/location-clean-up/output/TH44_Addresses_Cleaned_V2.xlsx")
+OUT  = Path("/Users/phachon/Documents/DKSH/location-clean-up/output/SAP_Location_Stage1_AddressClean.xlsx")
